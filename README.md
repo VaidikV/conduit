@@ -20,6 +20,36 @@ Five pieces, each earning its place:
 
 Design decisions live in `docs/`, written as we go. The docs are half the project.
 
+## Running locally
+
+Prerequisites: Node 24, Docker.
+
+```sh
+cp .env.example .env
+docker compose -f infra/compose.yaml up -d
+npm install
+npm run db:migrate
+npm run db:seed
+```
+
+Then run each process in its own terminal:
+
+```sh
+npm run dev:api        # :3000
+npm run dev:worker
+npm run dev:scheduler
+```
+
+Prove the queue works:
+
+```sh
+curl -X POST localhost:3000/workflows/11111111-1111-1111-1111-111111111111/run
+# watch the worker claim it, then:
+curl localhost:3000/jobs/<jobId>   # status: succeeded
+```
+
+The `heartbeat` workflow fires every minute on its own, so you can watch the scheduler enqueue without touching anything.
+
 ## Phases
 
 1. **First workflow, end to end.** A cron trigger fires, a worker picks it up, it calls a webhook, the execution is recorded. When this works, the repo goes public.
