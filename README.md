@@ -20,6 +20,8 @@ Five pieces, each earning its place:
 
 Design decisions live in `docs/`, written as we go. The docs are half the project.
 
+Learning along? [`docs/learn/`](docs/learn/) explains every substantial step in plain words, with diagrams.
+
 ## Running locally
 
 Prerequisites: Node 24, Docker.
