@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { CronExpressionParser } from 'cron-parser';
 import pool from '../lib/db.js';
-import { enqueueJob } from '../lib/queue.js';
+import { scheduleRun } from '../lib/executor.js';
 
 const TICK_MS = 10_000;
 
@@ -28,9 +28,12 @@ async function tick(): Promise<void> {
       console.log(`[scheduler] workflow "${wf.name}" has no cron expression, skipping`);
       continue;
     }
-    const jobId = await enqueueJob({
-      kind: 'workflow_run',
-      payload: { workflowId: wf.id, workflowName: wf.name, trigger: 'cron' },
+    // The run row and its job are created atomically: either both exist
+    // or neither does. No orphan runs, no orphan jobs.
+    const { runId, jobId } = await scheduleRun({
+      workflowId: wf.id,
+      workflowName: wf.name,
+      trigger: 'cron',
     });
     const next = CronExpressionParser.parse(expr).next().toDate();
     await pool.query('UPDATE workflows SET next_run_at = $2, updated_at = now() WHERE id = $1', [
@@ -38,7 +41,7 @@ async function tick(): Promise<void> {
       next,
     ]);
     console.log(
-      `[scheduler] enqueued ${jobId} for "${wf.name}", next run at ${next.toISOString()}`,
+      `[scheduler] run ${runId} (job ${jobId}) for "${wf.name}", next run at ${next.toISOString()}`,
     );
   }
 }
