@@ -5,10 +5,10 @@ This is where the system design lives. Every significant decision gets written u
 ## Open questions
 
 - ~~How do the scheduler, workers, and API server communicate?~~ Decided: ADR-001, Postgres as the queue.
-- What does a workflow definition look like? (JSON schema, versioned.)
-- What is the execution model for a single step? (At-least-once delivery, idempotency keys.)
+- ~~What does a workflow definition look like? (JSON schema, versioned.)~~ Decided: ADR-002, versioned JSON, linear steps.
+- What is the execution model for a single step? (At-least-once delivery, idempotency keys. v1 has no retries; a failed step fails the run.)
 - How are credentials encrypted, and where does the key live?
-- Postgres schema: workflows, executions, steps. What is the minimal schema that survives phase 2?
+- ~~Postgres schema: workflows, executions, steps. What is the minimal schema that survives phase 2?~~ Decided: ADR-002, `workflow_runs` + `step_executions`.
 
 ## Decisions
 
@@ -72,3 +72,24 @@ RETURNING *;
 ```
 
 **Wake-up.** After enqueue: `SELECT pg_notify('jobs', '<queue>')`. Workers `LISTEN`, then run the claim query instead of polling blind.
+
+### ADR-002: Workflow definitions and the run model (2026-09-24)
+
+**Context.** The queue moves jobs, but nothing defines what a chore *is*, and nothing durable records what happened when one ran. We need a workflow definition format and an execution record model before the worker can do real work.
+
+**Options considered.**
+
+1. Steps as separate jobs. Each step becomes its own queue job; the worker chains them. Fine-grained retries and parallelism fall out naturally. But it doubles the queue machinery on day one and makes "the run" a scattered concept.
+2. Steps inline in one job. The worker loads the definition and runs steps sequentially in-process. Simpler; the run is one unit. Parallelism and per-step retry become later problems.
+3. Step executions as a JSONB array on the run row vs. a `step_executions` table. The array is fewer tables; the table is queryable ("show me step 2 of run X") and index-friendly.
+
+**Decision.** Option 2 with a `step_executions` table.
+
+- Definitions are versioned JSON: `{ version: 1, trigger, steps: [...] }`. v1 supports linear steps only, no branching or loops. The `version` field lets future code distinguish old recipes from new ones instead of guessing.
+- Node types v1: `http_request` only. Trigger types: `cron`, `manual` (`webhook` reserved).
+- `workflow_runs`: one row per execution (trigger, status, timestamps). `step_executions`: one row per step per run (input, output, error, timestamps).
+- The jobs table stays the *delivery mechanism*; runs are the *durable record*. A job says "do this"; a run says "this happened". Jobs get cleaned up; runs are the audit log. This separation also anticipates fan-out later (one run, many jobs).
+- `scheduleRun` creates the run row and enqueues its job in a single transaction, then notifies. No orphan runs, no orphan jobs.
+- Failure semantics v1: the first failing step stops the run and marks it `failed`. No retries, no backoff. A non-2xx HTTP status counts as a step failure. `executeRun` refuses to re-execute a finished run.
+
+**Consequences.** The executor is deliberately sequential and strict. Retries, backoff, dead-lettering, idempotency keys, and parallel steps are all open phase-2 work, and each will be its own ADR. The worker no longer simulates: unknown job kinds fail loudly instead of pretending.
