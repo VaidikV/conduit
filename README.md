@@ -15,8 +15,8 @@ Five pieces, each earning its place:
 - **API server**: defines workflows, serves the control plane.
 - **Scheduler**: cron-like triggers, decides what is due.
 - **Workers**: pull jobs off the queue and execute steps. The pool scales horizontally.
-- **Postgres**: workflows, execution history, credentials. The source of truth.
-- **Redis**: the job queue, distributed locks, pub/sub. The nervous system.
+- **Postgres**: workflows, execution history, credentials, and the job queue itself (`FOR UPDATE SKIP LOCKED` + `LISTEN/NOTIFY`). The source of truth.
+- **Redis**: deferred. Postgres is the queue until an observed limitation says otherwise (ADR-001).
 
 Design decisions live in `docs/`, written as we go. The docs are half the project.
 
@@ -54,7 +54,7 @@ The `heartbeat` workflow fires every minute on its own, so you can watch the sch
 
 ## Phases
 
-1. **First workflow, end to end.** A cron trigger fires, a worker picks it up, it calls a webhook, the execution is recorded. When this works, the repo goes public.
+1. **First workflow, end to end.** A cron trigger fires, a worker picks it up, it calls a webhook, the execution is recorded. Done, this is the repo you are reading.
 2. **Durability.** Retries with backoff, dead letters, crash recovery. A worker can die mid-job and nothing is lost.
 3. **Webhooks and secrets.** The outside world calls in, credentials are encrypted at rest.
 4. **Multi-step workflows.** DAG execution, branching, real workflow semantics.
@@ -62,4 +62,4 @@ The `heartbeat` workflow fires every minute on its own, so you can watch the sch
 
 ## Status
 
-Private and early. Phase 1 is the only thing that matters right now.
+Public and early. Phase 1 (first workflow, end to end) is done; phase 2 (durability: retries, backoff, crash recovery) is up next.
