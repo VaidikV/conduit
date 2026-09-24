@@ -22,7 +22,7 @@ sequenceDiagram
     participant DB as Postgres
     participant W as Worker
     participant Web as Webhook<br/>(the outside world)
-    API->>DB: BEGIN; INSERT run; INSERT job; COMMIT<br/>(both exist or neither does)
+    API->>DB: BEGIN, INSERT run, INSERT job, COMMIT<br/>(both exist or neither does)
     API->>DB: NOTIFY (ring the bell)
     DB->>W: wake up
     W->>DB: claim job (SKIP LOCKED)
