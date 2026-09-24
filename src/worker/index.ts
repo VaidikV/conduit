@@ -2,14 +2,22 @@ import 'dotenv/config';
 import { randomUUID } from 'node:crypto';
 import pool from '../lib/db.js';
 import { claimJob, finishJob, listenForJobs, markRunning } from '../lib/queue.js';
+import { executeRun } from '../lib/executor.js';
 
 const workerId = `worker-${randomUUID().slice(0, 8)}`;
 let draining = false;
 
 async function execute(kind: string, payload: Record<string, unknown>): Promise<void> {
-  // Phase 1: simulate work. Real step execution comes with the workflow engine.
-  console.log(`[${workerId}] executing ${kind}`, JSON.stringify(payload));
-  await new Promise((r) => setTimeout(r, 1000));
+  if (kind === 'workflow_run') {
+    const runId = payload.runId;
+    if (typeof runId !== 'string') {
+      throw new Error('workflow_run job is missing payload.runId');
+    }
+    console.log(`[${workerId}] executing run ${runId}`);
+    await executeRun(runId);
+    return;
+  }
+  throw new Error(`unknown job kind: ${kind}`);
 }
 
 async function drain(): Promise<void> {
