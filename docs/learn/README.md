@@ -43,3 +43,4 @@ In the age of AI, typing out code is no longer the skill. Judging it is. So the 
 1. [What is Conduit?](01-what-is-conduit.md) — the big idea and the five pieces.
 2. [How the queue works](02-how-the-queue-works.md) — the to-do list, the bell, and the no-double-chore rule.
 3. [How a chore actually runs](03-how-a-chore-actually-runs.md) — the recipe, the run, the step receipts, and the first real webhook call.
+4. [How a run survives a crash](04-how-a-run-survives-a-crash.md) — at-least-once execution, resume from the ledger, and idempotency keys.

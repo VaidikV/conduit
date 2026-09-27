@@ -121,7 +121,14 @@ export async function scheduleRun(opts: {
 
 /**
  * Run every step of a run in order, recording each step execution.
- * First failing step stops the run. No retries in v1 (phase 2).
+ * First failing step stops the run.
+ *
+ * Resumable (phase 2): steps already recorded as succeeded are skipped, so
+ * calling executeRun again after a crash continues where the run stopped
+ * instead of starting over. Each (run, step) owns exactly one ledger row
+ * (see 003_step_identity.sql); a stale row left behind by a crashed worker
+ * is reset and the step re-executed. A second call for a finished run is
+ * still a no-op: finished runs are never executed twice.
  */
 export async function executeRun(runId: string): Promise<void> {
   const { rows } = await pool.query(
@@ -141,14 +148,35 @@ export async function executeRun(runId: string): Promise<void> {
 
   for (let i = 0; i < (def.steps ?? []).length; i++) {
     const step = (def.steps as StepDefinition[])[i];
+    // Claim the ledger row for this step: insert it fresh, or reset a stale
+    // one left by an earlier attempt. If the row is already succeeded for the
+    // same step id, the WHERE clause matches nothing and we get zero rows
+    // back: the step is done, skip it without re-firing. A succeeded row with
+    // a *different* step id means the definition changed mid-run, so the old
+    // receipt is for a different step and we re-run.
     const { rows: srows } = await pool.query(
       `INSERT INTO step_executions (run_id, step_id, step_index, input)
-       VALUES ($1, $2, $3, $4) RETURNING id`,
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (run_id, step_index) DO UPDATE
+         SET step_id = EXCLUDED.step_id,
+             status = 'running',
+             attempt = step_executions.attempt + 1,
+             input = EXCLUDED.input,
+             output = NULL,
+             error = NULL,
+             started_at = now(),
+             finished_at = NULL
+         WHERE step_executions.status <> 'succeeded'
+            OR step_executions.step_id <> EXCLUDED.step_id
+       RETURNING id`,
       [runId, step.id, i, JSON.stringify(step.config ?? {})],
     );
+    if (srows.length === 0) {
+      continue; // Already succeeded. Never re-fire a completed step.
+    }
     const stepExecId = srows[0].id as string;
     try {
-      const output = await runStep(step);
+      const output = await runStep(runId, i, step);
       await pool.query(
         `UPDATE step_executions
          SET status = 'succeeded', output = $2, finished_at = now()
@@ -177,10 +205,15 @@ export async function executeRun(runId: string): Promise<void> {
   );
 }
 
-async function runStep(step: StepDefinition): Promise<unknown> {
+async function runStep(runId: string, stepIndex: number, step: StepDefinition): Promise<unknown> {
   switch (step.type) {
     case 'http_request':
-      return runHttpRequest(step.id, (step.config ?? {}) as unknown as HttpRequestConfig);
+      return runHttpRequest(
+        runId,
+        stepIndex,
+        step.id,
+        (step.config ?? {}) as unknown as HttpRequestConfig,
+      );
     default:
       // Unreachable: validateDefinition rejects unknown types first.
       // Kept as a backstop so a bad row can never silently do nothing.
@@ -188,13 +221,28 @@ async function runStep(step: StepDefinition): Promise<unknown> {
   }
 }
 
-async function runHttpRequest(stepId: string, config: HttpRequestConfig): Promise<unknown> {
+async function runHttpRequest(
+  runId: string,
+  stepIndex: number,
+  stepId: string,
+  config: HttpRequestConfig,
+): Promise<unknown> {
   const url = config.url;
   if (!url || typeof url !== 'string') {
     throw new Error(`http_request "${stepId}": config.url is required`);
   }
   const method = (config.method ?? 'GET').toUpperCase();
   const headers: Record<string, string> = { ...(config.headers ?? {}) };
+  // Deterministic idempotency key: a retried attempt of the same step sends
+  // the same key, so a receiver that honors it dedupes instead of applying
+  // the request twice. This covers the crash window where the response came
+  // back but the success row was never written. An author-supplied key wins.
+  const hasIdempotencyKey = Object.keys(headers).some(
+    (k) => k.toLowerCase() === 'idempotency-key',
+  );
+  if (!hasIdempotencyKey) {
+    headers['idempotency-key'] = `${runId}:${stepIndex}`;
+  }
   let body: string | undefined;
   if (config.body !== undefined && method !== 'GET' && method !== 'HEAD') {
     body = typeof config.body === 'string' ? config.body : JSON.stringify(config.body);
