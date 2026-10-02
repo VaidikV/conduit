@@ -6,7 +6,7 @@ This is where the system design lives. Every significant decision gets written u
 
 - ~~How do the scheduler, workers, and API server communicate?~~ Decided: ADR-001, Postgres as the queue.
 - ~~What does a workflow definition look like? (JSON schema, versioned.)~~ Decided: ADR-002, versioned JSON, linear steps.
-- What is the execution model for a single step? (At-least-once delivery, idempotency keys. v1 has no retries; a failed step fails the run.)
+- ~~What is the execution model for a single step? (At-least-once delivery, idempotency keys. v1 has no retries; a failed step fails the run.)~~ Decided: ADR-003, selective retry with exponential backoff.
 - How are credentials encrypted, and where does the key live?
 - ~~Postgres schema: workflows, executions, steps. What is the minimal schema that survives phase 2?~~ Decided: ADR-002, `workflow_runs` + `step_executions`.
 
@@ -93,3 +93,27 @@ RETURNING *;
 - Failure semantics v1: the first failing step stops the run and marks it `failed`. No retries, no backoff. A non-2xx HTTP status counts as a step failure. `executeRun` refuses to re-execute a finished run.
 
 **Consequences.** The executor is deliberately sequential and strict. Retries, backoff, dead-lettering, idempotency keys, and parallel steps are all open phase-2 work, and each will be its own ADR. The worker no longer simulates: unknown job kinds fail loudly instead of pretending.
+
+### ADR-003: Retry policy and exponential backoff (2026-10-01)
+
+**Context.** A step that fails on the first try is often hitting a transient problem: the API had a bad moment, the network hiccuped, the request timed out. Failing the whole run immediately wastes the work already done and forces a human to re-run. But retrying blindly is also wrong: retrying a `400 Bad Request` is retrying a request that will never succeed, and hammering a struggling server with immediate retries makes the outage worse.
+
+**Options considered.**
+
+1. No retries (v1 behavior). Simple, but every transient blip becomes a failed run and a human re-run.
+2. Retry everything, fixed waits (n8n's shape: up to 5 tries, fixed interval). Simple, but retries permanent failures pointlessly and fixed waits punish a recovering server.
+3. Selective retry with exponential backoff (chosen). Retry only failures that could plausibly succeed later; wait longer between each attempt; honor the server's explicit `Retry-After`.
+
+**Decision.**
+
+- Retryable: network errors, timeouts, and HTTP 408, 429, 500, 502, 503, 504. These are "the server is having a bad moment" failures.
+- Not retryable: every other 4xx (400, 401, 403, 404, 422, ...) and programmer errors like a missing URL. These are "wrong number" failures; the identical request will fail identically.
+- Waits grow exponentially: 1s, 2s, 4s, 8s, ... capped at 30s, plus up to 1s of random jitter so many clients do not retry in lockstep (thundering herd).
+- A `429` honors the `Retry-After` header (delta-seconds or HTTP date), taking the longer of the backoff and the header, capped at 60s so one header cannot wedge a worker.
+- Budget: 5 total attempts per step by default; the author can set `config.retry.maxAttempts` per step, validated to 1-10.
+- The retry loop lives in the executor and sleeps between attempts. The worker holds the job during backoff. This is the simple correct choice while waits are seconds long; when a delayed-job mechanism exists, long waits can move to re-queued jobs instead.
+- The attempt counter comes from the ledger row (`RETURNING attempt`), not a loop variable, so a worker that crashes mid-backoff resumes with the same remaining budget. The failed attempt is recorded before each sleep, so resume finds a `failed` row and re-claims it.
+- Retries of a step send the identical idempotency key (`<run_id>:<step_index>`), so a retry that follows a lost response cannot double-apply on a cooperating receiver.
+- A step that exhausts its budget (or hits a non-retryable failure) fails the run, as before.
+
+**Consequences.** Runs now survive transient failures without human intervention, at the cost of a worker sleeping through backoff (worst case about 15s of waits per step at defaults, ~2.5 minutes at the 10-attempt ceiling). Retry storms are bounded by the per-step budget and the jitter. What happens *after* the budget is exhausted (dead-lettering, alerting) is still open phase-2 work.

@@ -1,4 +1,12 @@
 import pool from './db.js';
+import {
+  DEFAULT_MAX_ATTEMPTS,
+  MAX_ALLOWED_ATTEMPTS,
+  StepHttpError,
+  isRetryable,
+  retryDelayMs,
+  sleep,
+} from './retry.js';
 
 // ---------------------------------------------------------------------------
 // Workflow definitions (v1) and the executor that runs them (ADR-002).
@@ -15,6 +23,7 @@ export interface HttpRequestConfig {
   headers?: Record<string, string>;
   body?: unknown;
   timeoutMs?: number;
+  retry?: { maxAttempts?: number };
 }
 
 export interface StepDefinition {
@@ -69,7 +78,34 @@ export function validateDefinition(def: unknown): asserts def is WorkflowDefinit
     ) {
       throw new Error(`step "${step.id}": config must be an object`);
     }
+    // Optional retry policy: { "maxAttempts": 3 }. Bounds keep one step from
+    // wedging a worker: at least 1 (no retries), at most 10.
+    const retry = (step.config as Record<string, unknown> | undefined)?.retry;
+    if (retry !== undefined) {
+      if (typeof retry !== 'object' || retry === null || Array.isArray(retry)) {
+        throw new Error(`step "${step.id}": config.retry must be an object`);
+      }
+      const ma = (retry as Record<string, unknown>).maxAttempts;
+      if (
+        ma !== undefined &&
+        (!Number.isInteger(ma) ||
+          (ma as number) < 1 ||
+          (ma as number) > MAX_ALLOWED_ATTEMPTS)
+      ) {
+        throw new Error(
+          `step "${step.id}": config.retry.maxAttempts must be an integer between 1 and ${MAX_ALLOWED_ATTEMPTS}`,
+        );
+      }
+    }
   }
+}
+
+/** Total tries allowed for a step: the author's override, or the default. */
+function maxAttemptsFor(step: StepDefinition): number {
+  const retry = (step.config as Record<string, unknown> | undefined)?.retry as
+    | { maxAttempts?: number }
+    | undefined;
+  return retry?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
 }
 
 /**
@@ -148,54 +184,79 @@ export async function executeRun(runId: string): Promise<void> {
 
   for (let i = 0; i < (def.steps ?? []).length; i++) {
     const step = (def.steps as StepDefinition[])[i];
-    // Claim the ledger row for this step: insert it fresh, or reset a stale
-    // one left by an earlier attempt. If the row is already succeeded for the
-    // same step id, the WHERE clause matches nothing and we get zero rows
-    // back: the step is done, skip it without re-firing. A succeeded row with
-    // a *different* step id means the definition changed mid-run, so the old
-    // receipt is for a different step and we re-run.
-    const { rows: srows } = await pool.query(
-      `INSERT INTO step_executions (run_id, step_id, step_index, input)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (run_id, step_index) DO UPDATE
-         SET step_id = EXCLUDED.step_id,
-             status = 'running',
-             attempt = step_executions.attempt + 1,
-             input = EXCLUDED.input,
-             output = NULL,
-             error = NULL,
-             started_at = now(),
-             finished_at = NULL
-         WHERE step_executions.status <> 'succeeded'
-            OR step_executions.step_id <> EXCLUDED.step_id
-       RETURNING id`,
-      [runId, step.id, i, JSON.stringify(step.config ?? {})],
-    );
-    if (srows.length === 0) {
-      continue; // Already succeeded. Never re-fire a completed step.
-    }
-    const stepExecId = srows[0].id as string;
-    try {
-      const output = await runStep(runId, i, step);
-      await pool.query(
-        `UPDATE step_executions
-         SET status = 'succeeded', output = $2, finished_at = now()
-         WHERE id = $1`,
-        [stepExecId, JSON.stringify(output)],
+    const maxAttempts = maxAttemptsFor(step);
+    // Retry loop. Each iteration claims the ledger row: insert it fresh, or
+    // reset a stale one left by an earlier attempt. If the row is already
+    // succeeded for the same step id, the WHERE clause matches nothing and
+    // we get zero rows back: the step is done, skip it without re-firing.
+    // A succeeded row with a *different* step id means the definition
+    // changed mid-run, so the old receipt is for a different step and we
+    // re-run.
+    //
+    // The attempt number comes from the ledger row (RETURNING attempt), not
+    // from a local counter, so a worker that crashes mid-backoff and resumes
+    // still honors the same attempt budget: the ledger is the source of
+    // truth, not memory.
+    for (;;) {
+      const { rows: srows } = await pool.query(
+        `INSERT INTO step_executions (run_id, step_id, step_index, input)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (run_id, step_index) DO UPDATE
+           SET step_id = EXCLUDED.step_id,
+               status = 'running',
+               attempt = step_executions.attempt + 1,
+               input = EXCLUDED.input,
+               output = NULL,
+               error = NULL,
+               started_at = now(),
+               finished_at = NULL
+           WHERE step_executions.status <> 'succeeded'
+              OR step_executions.step_id <> EXCLUDED.step_id
+         RETURNING id, attempt`,
+        [runId, step.id, i, JSON.stringify(step.config ?? {})],
       );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      await pool.query(
-        `UPDATE step_executions
-         SET status = 'failed', error = $2, finished_at = now()
-         WHERE id = $1`,
-        [stepExecId, message],
-      );
-      await pool.query(
-        `UPDATE workflow_runs SET status = 'failed', finished_at = now() WHERE id = $1`,
-        [runId],
-      );
-      throw new Error(`step "${step.id}" failed: ${message}`);
+      if (srows.length === 0) {
+        break; // Already succeeded. Never re-fire a completed step.
+      }
+      const stepExecId = srows[0].id as string;
+      const attempt = srows[0].attempt as number;
+      try {
+        const output = await runStep(runId, i, step);
+        await pool.query(
+          `UPDATE step_executions
+           SET status = 'succeeded', output = $2, finished_at = now()
+           WHERE id = $1`,
+          [stepExecId, JSON.stringify(output)],
+        );
+        break;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const giveUp = attempt >= maxAttempts || !isRetryable(err);
+        // Record the failed attempt before deciding. If the worker crashes
+        // during the backoff sleep below, resume finds a 'failed' row and
+        // re-claims it: the retry is not lost, and the attempt was counted.
+        await pool.query(
+          `UPDATE step_executions
+           SET status = 'failed', error = $2, finished_at = now()
+           WHERE id = $1`,
+          [
+            stepExecId,
+            giveUp
+              ? message
+              : `${message} (attempt ${attempt}/${maxAttempts}, retrying)`,
+          ],
+        );
+        if (giveUp) {
+          await pool.query(
+            `UPDATE workflow_runs SET status = 'failed', finished_at = now() WHERE id = $1`,
+            [runId],
+          );
+          throw new Error(
+            `step "${step.id}" failed after ${attempt} attempt(s): ${message}`,
+          );
+        }
+        await sleep(retryDelayMs(err, attempt));
+      }
     }
   }
 
@@ -264,7 +325,9 @@ async function runHttpRequest(
       signal: AbortSignal.timeout(config.timeoutMs ?? DEFAULT_TIMEOUT_MS),
     });
   } catch (err) {
-    throw new Error(
+    // No response at all: network error, DNS failure, or timeout.
+    // Always retryable; StepHttpError with no status says so.
+    throw new StepHttpError(
       `http_request "${stepId}": request failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
@@ -275,16 +338,19 @@ async function runHttpRequest(
   res.headers.forEach((value, key) => {
     respHeaders[key] = value;
   });
-  const output = {
+
+  if (res.status < 200 || res.status >= 300) {
+    throw new StepHttpError(`http_request "${stepId}": unexpected status ${res.status}`, {
+      status: res.status,
+      headers: respHeaders,
+    });
+  }
+
+  return {
     status: res.status,
     headers: respHeaders,
     body: truncated ? text.slice(0, MAX_BODY_CHARS) : text,
     truncated,
     durationMs: Date.now() - started,
   };
-
-  if (res.status < 200 || res.status >= 300) {
-    throw new Error(`http_request "${stepId}": unexpected status ${res.status}`);
-  }
-  return output;
 }
