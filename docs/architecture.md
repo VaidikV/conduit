@@ -117,3 +117,16 @@ RETURNING *;
 - A step that exhausts its budget (or hits a non-retryable failure) fails the run, as before.
 
 **Consequences.** Runs now survive transient failures without human intervention, at the cost of a worker sleeping through backoff (worst case about 15s of waits per step at defaults, ~2.5 minutes at the 10-attempt ceiling). Retry storms are bounded by the per-step budget and the jitter. What happens *after* the budget is exhausted (dead-lettering, alerting) is still open phase-2 work.
+
+### ADR-004: Worker lease heartbeats (2026-10-03)
+
+**Context.** A claimed job carries `lease_expires_at`, but nothing renewed it: a worker that died mid-run left its job in `running` with a dead lease forever, and nothing re-queued it. The resume machinery (ADR-003 and the entry-04 ledger) only helps if something re-runs the job.
+
+**Decision.**
+
+- While a worker owns a job it renews the lease every 10 seconds; each renewal extends it by 30 seconds. The 1:3 ratio tolerates one or two missed beats (slow DB, GC pause) without mistaking a live worker for a dead one.
+- The heartbeat runs on a timer independent of the execution flow, so it keeps beating while steps run and through retry-backoff sleeps. A sleeping worker must not look dead.
+- Every lease mutation is conditional on ownership (`claimed_by = workerId`): `renewLease`, `markRunning`, and `finishJob` all no-op when the job is no longer ours. A partitioned ("zombie") worker whose job was reaped cannot resurrect the lease, and its late finish cannot overwrite the new owner's result; the discarded result is logged.
+- A heartbeat that throws (transient DB blip) is logged, not fatal. The lease may expire and the job may be reaped, but at-least-once execution covers that.
+
+**Consequences.** Death is now detectable: a stale `lease_expires_at` means the worker is gone or partitioned. Acting on it (re-queueing) is the reaper, still open. Heartbeats plus a reaper can cause two workers to run one job; that is safe because of the earlier decisions, at-least-once resume from the step ledger and idempotent retries, which is why this decision comes after them. Each heartbeat is one cheap indexed UPDATE per job per 10 seconds; at Conduit's scale that is negligible.

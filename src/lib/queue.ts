@@ -1,5 +1,21 @@
 import pool from './db.js';
 
+/**
+ * Lease heartbeats (phase 2, decision 3).
+ *
+ * A claimed job carries a lease: `lease_expires_at`. While a worker owns a
+ * job it must keep proving it is alive by renewing the lease; if the worker
+ * dies, the lease goes stale and the reaper (decision 4) can hand the job
+ * to someone else.
+ *
+ * Timing: the worker heartbeats every HEARTBEAT_INTERVAL_MS and each beat
+ * extends the lease by LEASE_TTL_SECONDS. The 1:3 ratio means two missed
+ * beats in a row (a slow DB, a GC pause) still do not expire the lease, so
+ * a live worker is not mistaken for a dead one.
+ */
+export const LEASE_TTL_SECONDS = 30;
+export const HEARTBEAT_INTERVAL_MS = 10_000;
+
 export interface Job {
   id: string;
   queue: string;
@@ -37,7 +53,7 @@ export async function claimJob(workerId: string, queue = 'default'): Promise<Job
      SET status = 'claimed',
          claimed_by = $1,
          claimed_at = now(),
-         lease_expires_at = now() + interval '30 seconds',
+         lease_expires_at = now() + make_interval(secs => $3),
          attempts = attempts + 1,
          updated_at = now()
      WHERE id = (
@@ -50,20 +66,57 @@ export async function claimJob(workerId: string, queue = 'default'): Promise<Job
        FOR UPDATE SKIP LOCKED
      )
      RETURNING *`,
-    [workerId, queue],
+    [workerId, queue, LEASE_TTL_SECONDS],
   );
   return (rows[0] as Job | undefined) ?? null;
 }
 
-export async function markRunning(id: string): Promise<void> {
-  await pool.query(`UPDATE jobs SET status = 'running', updated_at = now() WHERE id = $1`, [id]);
+export async function markRunning(id: string, workerId: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE jobs SET status = 'running', updated_at = now()
+     WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'`,
+    [id, workerId],
+  );
+  return (rowCount ?? 0) > 0;
 }
 
-export async function finishJob(id: string, status: 'succeeded' | 'failed'): Promise<void> {
-  await pool.query(
-    `UPDATE jobs SET status = $2, lease_expires_at = NULL, updated_at = now() WHERE id = $1`,
-    [id, status],
+/**
+ * Renew the lease on a job we own. Returns false when the job is no longer
+ * ours (it was reaped, or finished): the caller must stop heartbeating and
+ * must not touch the job again. A zombie worker that lost its job cannot
+ * resurrect the lease.
+ */
+export async function renewLease(jobId: string, workerId: string): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE jobs
+     SET lease_expires_at = now() + make_interval(secs => $3),
+         updated_at = now()
+     WHERE id = $1
+       AND claimed_by = $2
+       AND status IN ('claimed', 'running')`,
+    [jobId, workerId, LEASE_TTL_SECONDS],
   );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Finish a job we own. Conditional on ownership for the same reason as
+ * renewLease: a zombie worker whose job was reaped must not overwrite the
+ * new owner's result. The surviving execution (resumed from the step
+ * ledger, per decisions 1-2) is the one that counts.
+ * Returns true when the job was actually finished by this worker.
+ */
+export async function finishJob(
+  id: string,
+  status: 'succeeded' | 'failed',
+  workerId: string,
+): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE jobs SET status = $2, lease_expires_at = NULL, updated_at = now()
+     WHERE id = $1 AND claimed_by = $3 AND status IN ('claimed', 'running')`,
+    [id, status, workerId],
+  );
+  return (rowCount ?? 0) > 0;
 }
 
 /** Hold a dedicated connection and call onJob whenever a job is enqueued. */
