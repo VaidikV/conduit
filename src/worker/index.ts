@@ -3,10 +3,12 @@ import { randomUUID } from 'node:crypto';
 import pool from '../lib/db.js';
 import {
   HEARTBEAT_INTERVAL_MS,
+  REAPER_INTERVAL_MS,
   claimJob,
   finishJob,
   listenForJobs,
   markRunning,
+  reapExpiredJobs,
   renewLease,
 } from '../lib/queue.js';
 import { executeRun } from '../lib/executor.js';
@@ -86,6 +88,21 @@ async function main(): Promise<void> {
   await listenForJobs('default', () => {
     void drain();
   });
+  // The reaper: every REAPER_INTERVAL_MS each worker tries to sweep expired
+  // leases; an advisory lock elects exactly one active reaper, so this is
+  // safe with any number of workers and fails over if the reaper dies.
+  setInterval(() => {
+    reapExpiredJobs().then(
+      ({ requeued, dead }) => {
+        if (requeued.length > 0 || dead.length > 0) {
+          console.log(
+            `[${workerId}] reaper: requeued ${requeued.length}, dead ${dead.length}`,
+          );
+        }
+      },
+      (err) => console.error(`[${workerId}] reaper sweep failed`, err),
+    );
+  }, REAPER_INTERVAL_MS);
   await drain();
 }
 

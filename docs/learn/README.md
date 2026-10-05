@@ -46,3 +46,4 @@ In the age of AI, typing out code is no longer the skill. Judging it is. So the 
 4. [How a run survives a crash](04-how-a-run-survives-a-crash.md) — at-least-once execution, resume from the ledger, and idempotency keys.
 5. [How a step learns to knock politely](05-retry-policy-and-exponential-backoff.md): retry policy, exponential backoff with jitter, and honoring Retry-After.
 6. [How the worker proves it is still alive](06-how-the-worker-proves-it-is-still-alive.md): lease heartbeats, ownership-conditional writes, and the zombie worker.
+7. [How crashed jobs get rescued](07-how-crashed-jobs-get-rescued.md): the expired-job reaper, poison jobs, and automatic crash recovery.

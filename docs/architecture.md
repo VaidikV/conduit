@@ -130,3 +130,18 @@ RETURNING *;
 - A heartbeat that throws (transient DB blip) is logged, not fatal. The lease may expire and the job may be reaped, but at-least-once execution covers that.
 
 **Consequences.** Death is now detectable: a stale `lease_expires_at` means the worker is gone or partitioned. Acting on it (re-queueing) is the reaper, still open. Heartbeats plus a reaper can cause two workers to run one job; that is safe because of the earlier decisions, at-least-once resume from the step ledger and idempotent retries, which is why this decision comes after them. Each heartbeat is one cheap indexed UPDATE per job per 10 seconds; at Conduit's scale that is negligible.
+
+### ADR-005: Expired-job reaper and automatic crash recovery (2026-10-04)
+
+**Context.** Heartbeats (ADR-004) made worker death detectable via stale `lease_expires_at`, but nothing acted on it: crashed jobs sat in `running` forever.
+
+**Decision.**
+
+- Every worker attempts a reap sweep every 30 seconds; a Postgres advisory lock elects exactly one active reaper. No extra process to deploy; if the elected worker dies mid-sweep the lock dies with its connection and another worker takes over. The lock lives on a dedicated connection because session locks are per-connection.
+- Each sweep, in one transaction: jobs in `claimed`/`running` with `lease_expires_at < now()` and `attempts < max_attempts` go back to `queued` with claim fields cleared; those with `attempts >= max_attempts` go to `dead`, and their still-`running` workflow runs are marked `failed`. After commit, `pg_notify` per affected queue wakes idle workers.
+- Requeue is immediate (`run_at` already past); duplicates from a partitioned-then-healed worker are safe by the earlier decisions (ledger resume, idempotent retries).
+- A partial index on `lease_expires_at` for live jobs keeps the sweep cheap.
+
+**Options considered.** A dedicated reaper process (cleaner separation, but another deployment unit for a 30-second query); reaping inside every worker without a lock (idempotent outcome, but N duplicate sweeps and N duplicate notifies). The advisory-lock-in-worker won on simplicity with correct failover.
+
+**Consequences.** Crashed runs now recover within about a minute with no human involved. Poison jobs terminate at `max_attempts` deliveries instead of looping forever. What `dead` means beyond a status, alerting, inspection, replay, is the dead-letter decision, still open. The reaper's notify-after-requeue also quietly motivates the polling fallback: without that notify, idle workers would sleep through rescued jobs.
