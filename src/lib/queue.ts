@@ -127,6 +127,71 @@ export async function finishJob(
   return (rowCount ?? 0) > 0;
 }
 
+export type ReplayResult =
+  | { ok: true; jobId: string; queue: string }
+  | { ok: false; reason: 'not_found' | 'not_dead' };
+
+/**
+ * Dead-letter replay (phase 2, decision 5).
+ *
+ * A human has looked at a dead job, fixed whatever killed it, and wants it
+ * to try again. The job goes back to 'queued' with fresh budgets: job
+ * attempts reset to 0 and replay_count bumped, so this intervention is on
+ * the record. The run goes back to 'running' and failed step receipts get
+ * their attempt counters reset, but the ledger rows themselves are kept:
+ * the new execution resumes from the ledger (succeeded steps are still
+ * skipped) instead of restarting from zero.
+ *
+ * Only one replay wins: the UPDATE requires status='dead', so two racing
+ * replays cannot double-queue the job.
+ */
+export async function replayDeadJob(jobId: string): Promise<ReplayResult> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `UPDATE jobs
+       SET status = 'queued',
+           attempts = 0,
+           claimed_by = NULL,
+           claimed_at = NULL,
+           lease_expires_at = NULL,
+           run_at = now(),
+           replay_count = replay_count + 1,
+           updated_at = now()
+       WHERE id = $1 AND status = 'dead'
+       RETURNING id, queue, payload`,
+      [jobId],
+    );
+    if (rows.length === 0) {
+      await client.query('ROLLBACK');
+      const { rows: exists } = await client.query(`SELECT 1 FROM jobs WHERE id = $1`, [
+        jobId,
+      ]);
+      return { ok: false, reason: exists.length === 0 ? 'not_found' : 'not_dead' };
+    }
+    const job = rows[0];
+    const runId = (job.payload as Record<string, unknown> | null)?.runId;
+    if (typeof runId === 'string') {
+      await client.query(
+        `UPDATE workflow_runs SET status = 'running', finished_at = NULL
+         WHERE id = $1 AND status = 'failed'`,
+        [runId],
+      );
+      await client.query(
+        `UPDATE step_executions SET attempt = 0
+         WHERE run_id = $1 AND status <> 'succeeded'`,
+        [runId],
+      );
+    }
+    await client.query('COMMIT');
+    await client.query(`SELECT pg_notify('jobs', $1)`, [job.queue as string]);
+    return { ok: true, jobId: job.id as string, queue: job.queue as string };
+  } finally {
+    client.release();
+  }
+}
+
 /** Hold a dedicated connection and call onJob whenever a job is enqueued. */
 export async function listenForJobs(queue: string, onJob: () => void): Promise<void> {
   const client = await pool.connect();
@@ -222,6 +287,12 @@ export async function reapExpiredJobs(): Promise<ReapResult> {
       const queues = [...new Set(rq.map((r) => r.queue as string))];
       for (const qn of queues) {
         await client.query(`SELECT pg_notify('jobs', $1)`, [qn]);
+      }
+      // Alerting hook: anyone who wants to know when work dies (a Slack
+      // bot, a pager) LISTENs on 'dead_letters'. Wiring it to a real
+      // channel is operator configuration, not core behavior.
+      for (const d of dd) {
+        await client.query(`SELECT pg_notify('dead_letters', $1)`, [d.id as string]);
       }
       return {
         requeued: rq.map((r) => r.id as string),

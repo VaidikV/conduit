@@ -145,3 +145,17 @@ RETURNING *;
 **Options considered.** A dedicated reaper process (cleaner separation, but another deployment unit for a 30-second query); reaping inside every worker without a lock (idempotent outcome, but N duplicate sweeps and N duplicate notifies). The advisory-lock-in-worker won on simplicity with correct failover.
 
 **Consequences.** Crashed runs now recover within about a minute with no human involved. Poison jobs terminate at `max_attempts` deliveries instead of looping forever. What `dead` means beyond a status, alerting, inspection, replay, is the dead-letter decision, still open. The reaper's notify-after-requeue also quietly motivates the polling fallback: without that notify, idle workers would sleep through rescued jobs.
+
+### ADR-006: Dead-letter behavior (2026-10-05)
+
+**Context.** The reaper (ADR-005) retires poison jobs to `dead`, but `dead` was just a status: no visibility, no alerting, no way back.
+
+**Decision.** Three pieces, mirroring real message queues:
+
+- Visibility: `GET /jobs` with an optional validated `?status=` filter. `GET /jobs?status=dead` is the dead-letter queue: job, queue, deliveries burned, `replay_count`, and the payload (which carries the run id).
+- Replay: `POST /jobs/:id/replay`. One transaction resets the job to `queued` (attempts 0, `replay_count` + 1), flips the run back to `running`, and resets attempt counters on non-succeeded step receipts, while keeping the ledger rows so execution resumes instead of restarting. The reset requires `status = 'dead'`, so concurrent replays cannot double-queue; non-dead jobs get 400, unknown ids 404. After commit, `pg_notify` on the job's queue wakes a worker directly.
+- Alerting hook: the reaper `pg_notify('dead_letters', job_id)` for every retired job. Nothing in Conduit listens yet; wiring it to Slack/PagerDuty is operator configuration.
+
+**Why the step-budget reset matters.** Without it, a replayed run would re-claim the failed step, bump its counter past `maxAttempts`, and give up instantly without firing once: the human's fix would never get a chance. A replay means the world changed, so both budgets restart. Succeeded steps are untouched and still skipped.
+
+**Consequences.** Dead letters are now operable: seen, explained, and revived with one call each. The failure mode to respect: replay without a fix just burns fresh budgets and dies again, by design. Full alerting pipelines and replay-all/batch operations are future work.

@@ -1,10 +1,15 @@
 import 'dotenv/config';
 import express from 'express';
 import pool from '../lib/db.js';
+import { replayDeadJob } from '../lib/queue.js';
 import { scheduleRun, validateDefinition } from '../lib/executor.js';
 
 const app = express();
 app.use(express.json());
+
+const JOB_STATUSES = ['queued', 'claimed', 'running', 'succeeded', 'failed', 'dead'];
+const JOB_COLUMNS =
+  'id, queue, kind, status, attempts, max_attempts, replay_count, payload, claimed_by, created_at, updated_at';
 
 app.get('/health', async (_req, res) => {
   try {
@@ -94,6 +99,48 @@ app.get('/jobs/:id', async (req, res) => {
     res.status(404).json({ error: 'job not found' });
     return;
   }
+  res.json(rows[0]);
+});
+
+// Dead-letter visibility: list jobs, optionally filtered by status.
+// GET /jobs?status=dead is the dead-letter queue.
+app.get('/jobs', async (req, res) => {
+  const status = req.query.status;
+  if (
+    status !== undefined &&
+    (typeof status !== 'string' || !JOB_STATUSES.includes(status))
+  ) {
+    res.status(400).json({ error: `status must be one of: ${JOB_STATUSES.join(', ')}` });
+    return;
+  }
+  const { rows } =
+    status === undefined
+      ? await pool.query(
+          `SELECT ${JOB_COLUMNS} FROM jobs ORDER BY updated_at DESC LIMIT 100`,
+        )
+      : await pool.query(
+          `SELECT ${JOB_COLUMNS} FROM jobs WHERE status = $1 ORDER BY updated_at DESC LIMIT 100`,
+          [status],
+        );
+  res.json(rows);
+});
+
+// Dead-letter replay: a human fixed the cause, give the job fresh budgets.
+// The run resumes from its step ledger instead of restarting.
+app.post('/jobs/:id/replay', async (req, res) => {
+  const result = await replayDeadJob(req.params.id);
+  if (!result.ok) {
+    if (result.reason === 'not_found') {
+      res.status(404).json({ error: 'job not found' });
+      return;
+    }
+    res.status(400).json({ error: 'only dead jobs can be replayed' });
+    return;
+  }
+  const { rows } = await pool.query(
+    `SELECT ${JOB_COLUMNS} FROM jobs WHERE id = $1`,
+    [req.params.id],
+  );
   res.json(rows[0]);
 });
 
