@@ -48,3 +48,4 @@ In the age of AI, typing out code is no longer the skill. Judging it is. So the 
 6. [How the worker proves it is still alive](06-how-the-worker-proves-it-is-still-alive.md): lease heartbeats, ownership-conditional writes, and the zombie worker.
 7. [How crashed jobs get rescued](07-how-crashed-jobs-get-rescued.md): the expired-job reaper, poison jobs, and automatic crash recovery.
 8. [How dead jobs get a second chance](08-how-dead-jobs-get-a-second-chance.md): dead-letter visibility, replay with fresh budgets, and the alert hook.
+9. [One tick, one run](09-one-tick-one-run.md): scheduler concurrency and duplicate prevention with an atomic tick claim.

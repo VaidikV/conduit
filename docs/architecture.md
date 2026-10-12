@@ -159,3 +159,13 @@ RETURNING *;
 **Why the step-budget reset matters.** Without it, a replayed run would re-claim the failed step, bump its counter past `maxAttempts`, and give up instantly without firing once: the human's fix would never get a chance. A replay means the world changed, so both budgets restart. Succeeded steps are untouched and still skipped.
 
 **Consequences.** Dead letters are now operable: seen, explained, and revived with one call each. The failure mode to respect: replay without a fix just burns fresh budgets and dies again, by design. Full alerting pipelines and replay-all/batch operations are future work.
+
+### ADR-007: Scheduler concurrency and duplicate prevention (2026-10-11)
+
+**Context.** The scheduler ran SELECT-due, scheduleRun, UPDATE-next_run_at as three separate steps. Two scheduler processes, overlapping ticks, or a restart mid-tick could schedule the same cron tick twice.
+
+**Decision.** Claim the tick and create the run in ONE transaction. The gate is a conditional UPDATE: `UPDATE workflows SET next_run_at = <next> WHERE id = $1 AND (next_run_at IS NULL OR next_run_at <= now()) RETURNING id`. Only the winner (1 row) proceeds to insert the run and job; losers get 0 rows and roll back. Row locking serializes racers, and under READ COMMITTED the loser re-checks the WHERE against the winner's committed row. `scheduleRun` takes an optional client to join the caller's transaction (the caller then owns commit and notify); the API path is unchanged.
+
+No advisory-lock leader election: the gate already makes losing harmless (one cheap rolled-back UPDATE), so a lock would add only failover delay. Missed ticks do not backfill: after downtime, one catch-up run fires and next_run_at advances to the next cron time from now. Per-workflow errors (bad cron expression) are logged and skipped without aborting the sweep.
+
+**Consequences.** Exactly one run per tick under any number of schedulers, restarts, or overlaps; a crash between claim and schedule rolls back instead of skipping the tick. The failure mode to respect: clock skew between scheduler hosts could delay or hasten ticks; the gate still prevents duplicates.

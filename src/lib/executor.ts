@@ -1,4 +1,5 @@
 import pool from './db.js';
+import type { PoolClient } from 'pg';
 import {
   DEFAULT_MAX_ATTEMPTS,
   MAX_ALLOWED_ATTEMPTS,
@@ -111,24 +112,33 @@ function maxAttemptsFor(step: StepDefinition): number {
 /**
  * Create the run row and enqueue its job in ONE transaction, then ring the
  * bell. Either both exist or neither does: no orphan runs, no orphan jobs.
+ *
+ * Pass a client to join the caller's transaction instead (phase 2,
+ * decision 6: the scheduler claims the cron tick and schedules the run
+ * atomically). The caller then owns COMMIT/ROLLBACK and must ring the bell
+ * itself after its own commit.
  */
-export async function scheduleRun(opts: {
-  workflowId: string;
-  workflowName: string;
-  trigger: string;
-  queue?: string;
-  input?: unknown;
-}): Promise<{ runId: string; jobId: string }> {
+export async function scheduleRun(
+  opts: {
+    workflowId: string;
+    workflowName: string;
+    trigger: string;
+    queue?: string;
+    input?: unknown;
+  },
+  client?: PoolClient,
+): Promise<{ runId: string; jobId: string }> {
   const queue = opts.queue ?? 'default';
-  const client = await pool.connect();
+  const c = client ?? (await pool.connect());
+  const managed = client === undefined;
   try {
-    await client.query('BEGIN');
-    const run = await client.query(
+    if (managed) await c.query('BEGIN');
+    const run = await c.query(
       `INSERT INTO workflow_runs (workflow_id, trigger) VALUES ($1, $2) RETURNING id`,
       [opts.workflowId, opts.trigger],
     );
     const runId = run.rows[0].id as string;
-    const job = await client.query(
+    const job = await c.query(
       `INSERT INTO jobs (queue, kind, payload)
        VALUES ($1, 'workflow_run', $2) RETURNING id`,
       [
@@ -143,15 +153,15 @@ export async function scheduleRun(opts: {
       ],
     );
     const jobId = job.rows[0].id as string;
-    await client.query('COMMIT');
+    if (managed) await c.query('COMMIT');
     // Notify only after the commit: no bell for a run that was rolled back.
-    await pool.query(`SELECT pg_notify('jobs', $1)`, [queue]);
+    if (managed) await pool.query(`SELECT pg_notify('jobs', $1)`, [queue]);
     return { runId, jobId };
   } catch (err) {
-    await client.query('ROLLBACK');
+    if (managed) await c.query('ROLLBACK');
     throw err;
   } finally {
-    client.release();
+    if (managed) c.release();
   }
 }
 
