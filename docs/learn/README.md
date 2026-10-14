@@ -49,3 +49,4 @@ In the age of AI, typing out code is no longer the skill. Judging it is. So the 
 7. [How crashed jobs get rescued](07-how-crashed-jobs-get-rescued.md): the expired-job reaper, poison jobs, and automatic crash recovery.
 8. [How dead jobs get a second chance](08-how-dead-jobs-get-a-second-chance.md): dead-letter visibility, replay with fresh budgets, and the alert hook.
 9. [One tick, one run](09-one-tick-one-run.md): scheduler concurrency and duplicate prevention with an atomic tick claim.
+10. [When the bell never rings](10-when-the-bell-never-rings.md): polling fallback for missed notifications.

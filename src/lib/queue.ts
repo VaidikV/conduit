@@ -21,6 +21,21 @@ export const HEARTBEAT_INTERVAL_MS = 10_000;
  * reaps at a time (advisory lock below); the rest no-op.
  */
 export const REAPER_INTERVAL_MS = 30_000;
+/**
+ * How often each worker polls the queue directly, even without a bell
+ * (phase 2, decision 7: polling fallback for missed notifications).
+ *
+ * Bells are fire-and-forget: Postgres delivers pg_notify only to
+ * currently-connected LISTENers. If the worker's listen connection drops
+ * (network blip, DB restart), every bell after that is silently lost and
+ * the worker would sleep with queued jobs piling up. The poll bounds that
+ * damage: at worst a missed bell delays pickup by one interval, and a
+ * permanently dead LISTEN connection heals itself without reconnect logic.
+ * The hot path stays instant via bells; this is purely the safety net, so
+ * it shares the reaper's 30s cadence. Each idle poll is one cheap indexed
+ * claim attempt.
+ */
+export const POLL_INTERVAL_MS = 30_000;
 /** Advisory-lock key electing the single active reaper. Any fixed bigint works. */
 export const REAPER_ADVISORY_LOCK = 20261004;
 

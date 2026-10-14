@@ -169,3 +169,11 @@ RETURNING *;
 No advisory-lock leader election: the gate already makes losing harmless (one cheap rolled-back UPDATE), so a lock would add only failover delay. Missed ticks do not backfill: after downtime, one catch-up run fires and next_run_at advances to the next cron time from now. Per-workflow errors (bad cron expression) are logged and skipped without aborting the sweep.
 
 **Consequences.** Exactly one run per tick under any number of schedulers, restarts, or overlaps; a crash between claim and schedule rolls back instead of skipping the tick. The failure mode to respect: clock skew between scheduler hosts could delay or hasten ticks; the gate still prevents duplicates.
+
+### ADR-008: Polling fallback for missed notifications (2026-10-13)
+
+**Context.** Workers wake on pg_notify bells, which Postgres delivers only to currently-connected LISTENers. A dropped LISTEN connection (network blip, DB restart) silently loses every later bell; the worker would sleep with queued jobs piling up.
+
+**Decision.** Every worker also drains the queue directly every POLL_INTERVAL_MS (30s, sharing the reaper's cadence). A missed bell now delays pickup by at most one interval. The poll runs on every worker rather than piggybacking the reaper sweep, because the reaper elects a single active sweeper: if that worker died, a piggybacked fallback would die with it. No new concurrency control was needed: the drain() reentrancy guard makes a poll that races a bell or lands mid-drain a harmless no-op, and claimJob's SKIP LOCKED remains the guarantee against double execution.
+
+**Consequences.** The worst case after any missed wakeup is 30s of delay, and a permanently dead LISTEN connection heals itself with no reconnect logic. Bells still drive the instant hot path; the poll is purely the safety net. Cost: one cheap indexed claim attempt per worker per 30s when idle.

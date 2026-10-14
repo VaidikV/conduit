@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import pool from '../lib/db.js';
 import {
   HEARTBEAT_INTERVAL_MS,
+  POLL_INTERVAL_MS,
   REAPER_INTERVAL_MS,
   claimJob,
   finishJob,
@@ -88,6 +89,18 @@ async function main(): Promise<void> {
   await listenForJobs('default', () => {
     void drain();
   });
+  // The polling fallback (phase 2, decision 7): every POLL_INTERVAL_MS each
+  // worker drains the queue directly, so a missed pg_notify bell (dropped
+  // LISTEN connection, or any other lost wakeup) delays pickup by at most
+  // one interval instead of stalling forever. The drain() guard makes a
+  // poll that lands mid-drain (or races a bell) a harmless no-op: the
+  // in-flight drain's loop-until-empty already covers the new job.
+  setInterval(
+    () => {
+      drain().catch((err) => console.error(`[${workerId}] poll drain failed`, err));
+    },
+    POLL_INTERVAL_MS,
+  );
   // The reaper: every REAPER_INTERVAL_MS each worker tries to sweep expired
   // leases; an advisory lock elects exactly one active reaper, so this is
   // safe with any number of workers and fails over if the reaper dies.
